@@ -614,8 +614,8 @@ def build_sam3_image_model(
         device = get_default_device()
 
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+        bpe_path = os.path.join(
+            os.path.dirname(__file__), "assets", "bpe_simple_vocab_16e6.txt.gz"
         )
 
     # Create visual components
@@ -718,8 +718,8 @@ def build_sam3_video_model(
         device = get_default_device()
 
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+        bpe_path = os.path.join(
+            os.path.dirname(__file__), "assets", "bpe_simple_vocab_16e6.txt.gz"
         )
 
     # Build Tracker module
@@ -1133,8 +1133,8 @@ def build_sam3_multiplex_video_predictor(
         Sam3MultiplexVideoPredictor: The fully-initialized predictor
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+        bpe_path = os.path.join(
+            os.path.dirname(__file__), "assets", "bpe_simple_vocab_16e6.txt.gz"
         )
 
     from sam3.model.sam3_multiplex_base import Sam3MultiplexPredictorWrapper
