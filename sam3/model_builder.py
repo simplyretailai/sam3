@@ -63,7 +63,17 @@ def _setup_tf32() -> None:
 _setup_tf32()
 
 
-def _create_position_encoding(precompute_resolution=None):
+def get_default_device():
+    """Get the default device with priority: CUDA > MPS > CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+
+def _create_position_encoding(device: str, precompute_resolution=None):
     """Create position encoding for visual backbone."""
     return PositionEmbeddingSine(
         num_pos_feats=256,
@@ -71,6 +81,7 @@ def _create_position_encoding(precompute_resolution=None):
         scale=None,
         temperature=10000,
         precompute_resolution=precompute_resolution,
+        device=device,
     )
 
 
@@ -162,7 +173,7 @@ def _create_transformer_encoder(use_fa3=False) -> TransformerEncoderFusion:
     return encoder
 
 
-def _create_transformer_decoder(use_fa3=False) -> TransformerDecoder:
+def _create_transformer_decoder(device: str, use_fa3=False) -> TransformerDecoder:
     """Create transformer decoder with its layer."""
     decoder_layer = TransformerDecoderLayer(
         activation="relu",
@@ -196,6 +207,7 @@ def _create_transformer_decoder(use_fa3=False) -> TransformerDecoder:
         stride=14,
         use_act_checkpoint=True,
         presence_token=True,
+        device=device,
     )
     return decoder
 
@@ -243,10 +255,10 @@ def _create_segmentation_head(compile_mode=None, use_fa3=False):
     return segmentation_head
 
 
-def _create_geometry_encoder():
+def _create_geometry_encoder(device: str):
     """Create geometry encoder with all its components."""
     # Create position encoding for geometry encoder
-    geo_pos_enc = _create_position_encoding()
+    geo_pos_enc = _create_position_encoding(device=device)
     # Create CX block for fuser
     cx_block = CXBlock(
         dim=256,
@@ -341,7 +353,7 @@ def _create_sam3_model(
     return model
 
 
-def _create_tracker_maskmem_backbone():
+def _create_tracker_maskmem_backbone(device: str):
     """Create the SAM3 Tracker memory encoder."""
     # Position encoding for mask memory backbone
     position_encoding = PositionEmbeddingSine(
@@ -350,6 +362,7 @@ def _create_tracker_maskmem_backbone():
         scale=None,
         temperature=10000,
         precompute_resolution=1008,
+        device=device,
     )
 
     # Mask processing components
@@ -443,7 +456,8 @@ def _create_tracker_transformer():
 
 
 def build_tracker(
-    apply_temporal_disambiguation: bool, with_backbone: bool = False, compile_mode=None
+    apply_temporal_disambiguation: bool, device: str,
+    with_backbone: bool = False, compile_mode=None,
 ) -> Sam3TrackerPredictor:
     """
     Build the SAM3 Tracker module for video tracking.
@@ -453,11 +467,11 @@ def build_tracker(
     """
 
     # Create model components
-    maskmem_backbone = _create_tracker_maskmem_backbone()
+    maskmem_backbone = _create_tracker_maskmem_backbone(device=device)
     transformer = _create_tracker_transformer()
     backbone = None
     if with_backbone:
-        vision_backbone = _create_vision_backbone(compile_mode=compile_mode)
+        vision_backbone = _create_vision_backbone(compile_mode=compile_mode, device=device)
         backbone = SAM3VLBackbone(scalp=1, visual=vision_backbone, text=None)
     # Create the Tracker module
     model = Sam3TrackerPredictor(
@@ -510,11 +524,11 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
 
 
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True
+    device: str, compile_mode=None, enable_inst_interactivity=True,
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(precompute_resolution=1008, device=device)
     # ViT backbone
     vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
@@ -527,11 +541,11 @@ def _create_vision_backbone(
 
 
 def _create_sam3_transformer(
-    has_presence_token: bool = True, use_fa3: bool = False
+    device: str, has_presence_token: bool = True, use_fa3: bool = False,
 ) -> TransformerWrapper:
     """Create SAM3 transformer encoder and decoder."""
     encoder: TransformerEncoderFusion = _create_transformer_encoder(use_fa3=use_fa3)
-    decoder: TransformerDecoder = _create_transformer_decoder(use_fa3=use_fa3)
+    decoder: TransformerDecoder = _create_transformer_decoder(use_fa3=use_fa3, device=device)
 
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
@@ -563,8 +577,9 @@ def _load_checkpoint(model, checkpoint_path):
 
 def _setup_device_and_mode(model, device, eval_mode):
     """Setup model device and evaluation mode."""
-    if device == "cuda":
-        model = model.cuda()
+    if str(device) == "mps":
+        model = model.float()
+    model = model.to(device)
     if eval_mode:
         model.eval()
     return model
@@ -572,7 +587,7 @@ def _setup_device_and_mode(model, device, eval_mode):
 
 def build_sam3_image_model(
     bpe_path=None,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=None,
     eval_mode=True,
     checkpoint_path=None,
     load_from_HF=True,
@@ -585,7 +600,7 @@ def build_sam3_image_model(
 
     Args:
         bpe_path: Path to the BPE tokenizer vocabulary
-        device: Device to load the model on ('cuda' or 'cpu')
+        device: Device to load the model on ('cuda', 'mps', or 'cpu'). If None, autodetect.
         eval_mode: Whether to set the model to evaluation mode
         checkpoint_path: Optional path to model checkpoint
         enable_segmentation: Whether to enable segmentation head
@@ -595,15 +610,19 @@ def build_sam3_image_model(
     Returns:
         A SAM3 image model
     """
+    if device is None:
+        device = get_default_device()
+
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+        bpe_path = os.path.join(
+            os.path.dirname(__file__), "assets", "bpe_simple_vocab_16e6.txt.gz"
         )
 
     # Create visual components
     compile_mode = "default" if compile else None
     vision_encoder = _create_vision_backbone(
-        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity
+        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity,
+        device=device,
     )
 
     # Create text components
@@ -613,7 +632,7 @@ def build_sam3_image_model(
     backbone = _create_vl_backbone(vision_encoder, text_encoder)
 
     # Create transformer components
-    transformer = _create_sam3_transformer()
+    transformer = _create_sam3_transformer(device=device)
 
     # Create dot product scoring
     dot_prod_scoring = _create_dot_product_scoring()
@@ -626,9 +645,9 @@ def build_sam3_image_model(
     )
 
     # Create geometry encoder
-    input_geometry_encoder = _create_geometry_encoder()
+    input_geometry_encoder = _create_geometry_encoder(device=device)
     if enable_inst_interactivity:
-        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
+        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False, device=device)
         inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
     else:
         inst_predictor = None
@@ -681,7 +700,7 @@ def build_sam3_video_model(
     geo_encoder_use_img_cross_attn: bool = True,
     strict_state_dict_loading: bool = True,
     apply_temporal_disambiguation: bool = True,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=None,
     compile=False,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
@@ -690,25 +709,29 @@ def build_sam3_video_model(
     Args:
         checkpoint_path: Optional path to checkpoint file
         bpe_path: Path to the BPE tokenizer file
+        device: Device to load the model on ('cuda', 'mps', or 'cpu'). If None, autodetect.
 
     Returns:
         Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
     """
+    if device is None:
+        device = get_default_device()
+
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+        bpe_path = os.path.join(
+            os.path.dirname(__file__), "assets", "bpe_simple_vocab_16e6.txt.gz"
         )
 
     # Build Tracker module
-    tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
+    tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation, device=device)
 
     # Build Detector components
-    visual_neck = _create_vision_backbone()
+    visual_neck = _create_vision_backbone(device=device)
     text_encoder = _create_text_encoder(bpe_path)
     backbone = SAM3VLBackbone(scalp=1, visual=visual_neck, text=text_encoder)
-    transformer = _create_sam3_transformer(has_presence_token=has_presence_token)
+    transformer = _create_sam3_transformer(has_presence_token=has_presence_token, device=device)
     segmentation_head: UniversalSegmentationHead = _create_segmentation_head()
-    input_geometry_encoder = _create_geometry_encoder()
+    input_geometry_encoder = _create_geometry_encoder(device=device)
 
     # Create main dot product scoring
     main_dot_prod_mlp = MLP(
@@ -820,7 +843,7 @@ def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
     )
 
 
-def _create_multiplex_maskmem_backbone(multiplex_count=16):
+def _create_multiplex_maskmem_backbone(device: str, multiplex_count=16):
     """Create the multiplex memory encoder with per-object mask channels."""
     position_encoding = PositionEmbeddingSine(
         num_pos_feats=256,
@@ -828,6 +851,7 @@ def _create_multiplex_maskmem_backbone(multiplex_count=16):
         scale=None,
         temperature=10000,
         precompute_resolution=1008,
+        device=device,
     )
 
     mask_downsampler = SimpleMaskDownSampler(
@@ -918,10 +942,10 @@ def _create_multiplex_transformer(use_fa3=False, use_rope_real=False):
 
 
 def _create_multiplex_tri_backbone(
-    compile_mode=None, use_fa3=False, use_rope_real=False
+    device: str, compile_mode=None, use_fa3=False, use_rope_real=False,
 ):
     """Create the TriHead vision backbone for multiplex model."""
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(device=device, precompute_resolution=1008)
     vit_backbone = _create_vit_backbone(
         compile_mode=compile_mode, use_fa3=use_fa3, use_rope_real=use_rope_real
     )
@@ -941,7 +965,7 @@ def build_sam3_multiplex_video_model(
     use_fa3: bool = False,
     use_rope_real: bool = False,
     strict_state_dict_loading: bool = True,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=None,
     compile=False,
 ):
     """
@@ -953,21 +977,24 @@ def build_sam3_multiplex_video_model(
         use_fa3: Whether to use FlashAttention 3
         use_rope_real: Whether to use real-valued RoPE (for compile compat)
         strict_state_dict_loading: Whether to use strict state dict loading
-        device: Device to place model on
+        device: Device to place model on ('cuda', 'mps', or 'cpu'). If None, autodetect.
         compile: Whether to compile model components
 
     Returns:
         VideoTrackingDynamicMultiplex: The instantiated multiplex tracking model
     """
+    if device is None:
+        device = get_default_device()
+
     # Build multiplex-specific components
     maskmem_backbone = _create_multiplex_maskmem_backbone(
-        multiplex_count=multiplex_count
+        multiplex_count=multiplex_count, device=device,
     )
     transformer = _create_multiplex_transformer(
         use_fa3=use_fa3, use_rope_real=use_rope_real
     )
     tri_neck = _create_multiplex_tri_backbone(
-        compile_mode="max-autotune" if compile else None
+        compile_mode="max-autotune" if compile else None, device=device,
     )
     backbone = TriHeadVisionOnly(
         visual=tri_neck,
@@ -1079,6 +1106,7 @@ def build_sam3_multiplex_video_predictor(
     session_expiration_sec: int = 1200,
     default_output_prob_thresh: float = 0.5,
     async_loading_frames: bool = True,
+    device=None,
 ):
     """
     Build a fully-initialized Sam3MultiplexVideoPredictor.
@@ -1105,8 +1133,8 @@ def build_sam3_multiplex_video_predictor(
         Sam3MultiplexVideoPredictor: The fully-initialized predictor
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+        bpe_path = os.path.join(
+            os.path.dirname(__file__), "assets", "bpe_simple_vocab_16e6.txt.gz"
         )
 
     from sam3.model.sam3_multiplex_base import Sam3MultiplexPredictorWrapper
@@ -1139,13 +1167,13 @@ def build_sam3_multiplex_video_predictor(
 
     # Build detector
     tri_neck = _create_multiplex_tri_backbone(
-        compile_mode=None, use_fa3=use_fa3, use_rope_real=use_rope_real
+        compile_mode=None, use_fa3=use_fa3, use_rope_real=use_rope_real, device=device,
     )
     text_encoder = _create_text_encoder(bpe_path)
     backbone = SAM3VLBackboneTri(scalp=0, visual=tri_neck, text=text_encoder)
-    transformer = _create_sam3_transformer(use_fa3=use_fa3)
+    transformer = _create_sam3_transformer(use_fa3=use_fa3, device=device)
     segmentation_head = _create_segmentation_head(use_fa3=use_fa3)
-    geometry_encoder = _create_geometry_encoder()
+    geometry_encoder = _create_geometry_encoder(device=device)
     dot_prod_scoring = _create_dot_product_scoring()
 
     detector = Sam3MultiplexDetector(
